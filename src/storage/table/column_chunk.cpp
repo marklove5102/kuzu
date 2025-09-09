@@ -9,11 +9,11 @@
 #include "main/client_context.h"
 #include "storage/buffer_manager/memory_manager.h"
 #include "storage/enums/residency_state.h"
-#include "storage/file_handle.h"
 #include "storage/page_allocator.h"
 #include "storage/storage_utils.h"
 #include "storage/table/column.h"
 #include "storage/table/column_chunk_data.h"
+#include "storage/table/segment_scanner.h"
 #include "transaction/transaction.h"
 
 using namespace kuzu::common;
@@ -103,7 +103,7 @@ void ColumnChunk::scan(const Transaction* transaction, const ChunkState& state, 
 
 template<ResidencyState SCAN_RESIDENCY_STATE>
 void ColumnChunk::scanCommitted(const Transaction* transaction, ChunkState& chunkState,
-    ColumnChunkData& output, row_idx_t startRow, row_idx_t numRows) const {
+    SegmentScanner& output, row_idx_t startRow, row_idx_t numRows) const {
     auto numValuesInChunk = getNumValues();
     if (numRows == INVALID_ROW_IDX || startRow + numRows > numValuesInChunk) {
         numRows = numValuesInChunk - startRow;
@@ -115,17 +115,28 @@ void ColumnChunk::scanCommitted(const Transaction* transaction, ChunkState& chun
     switch (const auto residencyState = getResidencyState()) {
     case ResidencyState::ON_DISK: {
         if (SCAN_RESIDENCY_STATE == residencyState) {
-            chunkState.column->scan(chunkState, &output, startRow, numRows);
-            scanCommittedUpdates(transaction, output, numValuesBeforeScan, startRow, numRows);
+            // output.setNumValues(0);
+            [[maybe_unused]] uint64_t numValuesScanned = chunkState.rangeSegments(startRow, numRows,
+                [&](auto& segmentState, auto offsetInSegment, auto lengthInSegment,
+                    auto dstOffset) {
+                    output.initSegment(dstOffset, lengthInSegment,
+                        [&chunkState, &segmentState, offsetInSegment, lengthInSegment](
+                            ColumnChunkData& outputChunk) {
+                            chunkState.column->scanSegment(segmentState, &outputChunk,
+                                offsetInSegment, lengthInSegment);
+                        });
+                });
+            KU_ASSERT(output.getNumValues() == numValuesScanned);
         }
     } break;
     case ResidencyState::IN_MEMORY: {
         if (SCAN_RESIDENCY_STATE == residencyState) {
             rangeSegments(startRow, numRows,
-                [&](auto& segment, auto offsetInSegment, auto lengthInSegment, auto dstOffset) {
-                    output.append(&segment, startRow, lengthInSegment);
-                    scanCommittedUpdates(transaction, output, numValuesBeforeScan + dstOffset,
-                        offsetInSegment, lengthInSegment);
+                [&](auto& segment, auto, auto lengthInSegment, auto dstOffset) {
+                    output.initSegment(dstOffset, lengthInSegment,
+                        [&segment, startRow, lengthInSegment](ColumnChunkData& outputChunk) {
+                            outputChunk.append(&segment, startRow, lengthInSegment);
+                        });
                 });
         }
     } break;
@@ -133,20 +144,26 @@ void ColumnChunk::scanCommitted(const Transaction* transaction, ChunkState& chun
         KU_UNREACHABLE;
     }
     }
+    output.rangeSegments(startRow, numRows,
+        [&](auto segmentIdx, auto offsetInSegment, auto lengthInSegment, auto dstOffset) {
+            scanCommittedUpdates(transaction, output, segmentIdx, numValuesBeforeScan + dstOffset,
+                offsetInSegment, lengthInSegment);
+        });
 }
 
 template void ColumnChunk::scanCommitted<ResidencyState::ON_DISK>(const Transaction* transaction,
-    ChunkState& chunkState, ColumnChunkData& output, row_idx_t startRow, row_idx_t numRows) const;
+    ChunkState& chunkState, SegmentScanner& output, row_idx_t startRow, row_idx_t numRows) const;
 template void ColumnChunk::scanCommitted<ResidencyState::IN_MEMORY>(const Transaction* transaction,
-    ChunkState& chunkState, ColumnChunkData& output, row_idx_t startRow, row_idx_t numRows) const;
+    ChunkState& chunkState, SegmentScanner& output, row_idx_t startRow, row_idx_t numRows) const;
 
 bool ColumnChunk::hasUpdates(const Transaction* transaction, row_idx_t startRow,
     length_t numRows) const {
     return updateInfo && updateInfo->hasUpdates(transaction, startRow, numRows);
 }
 
-void ColumnChunk::scanCommittedUpdates(const Transaction* transaction, ColumnChunkData& output,
-    offset_t startOffsetInOutput, row_idx_t startRowScanned, row_idx_t numRows) const {
+void ColumnChunk::scanCommittedUpdates(const Transaction* transaction, SegmentScanner& output,
+    common::idx_t segmentIdx, offset_t startOffsetInOutput, row_idx_t startRowScanned,
+    row_idx_t numRows) const {
     if (!updateInfo) {
         return;
     }
@@ -158,24 +175,29 @@ void ColumnChunk::scanCommittedUpdates(const Transaction* transaction, ColumnChu
     while (vectorIdx <= endVectorIdx) {
         const auto startRow = vectorIdx == startVectorIdx ? startRowInVector : 0;
         const auto endRow = vectorIdx == endVectorIdx ? endRowInVector : DEFAULT_VECTOR_CAPACITY;
-        // const auto numRowsInVector = endRow - startRow;
         const auto vectorInfo = updateInfo->getVectorInfo(transaction, vectorIdx);
         if (vectorInfo && vectorInfo->numRowsUpdated > 0) {
             if (vectorIdx != startVectorIdx && vectorIdx != endVectorIdx) {
                 for (auto i = 0u; i < vectorInfo->numRowsUpdated; i++) {
-                    output.write(vectorInfo->data.get(), i,
+                    output.writeToSegment(*vectorInfo->data, segmentIdx, i,
                         startOffsetInOutput + vectorIdx * DEFAULT_VECTOR_CAPACITY +
-                            vectorInfo->rowsInVector[i] - startRowScanned,
-                        1);
+                            vectorInfo->rowsInVector[i] - startRowScanned);
+                    // output.write(vectorInfo->data.get(), i,
+                    //     startOffsetInOutput + vectorIdx * DEFAULT_VECTOR_CAPACITY +
+                    //         vectorInfo->rowsInVector[i] - startRowScanned,
+                    //     1);
                 }
             } else {
                 for (auto i = 0u; i < vectorInfo->numRowsUpdated; i++) {
                     const auto rowInVecUpdated = vectorInfo->rowsInVector[i];
                     if (rowInVecUpdated >= startRow && rowInVecUpdated < endRow) {
-                        output.write(vectorInfo->data.get(), i,
+                        output.writeToSegment(*vectorInfo->data, segmentIdx, i,
                             startOffsetInOutput + vectorIdx * DEFAULT_VECTOR_CAPACITY +
-                                rowInVecUpdated - startRowScanned,
-                            1);
+                                rowInVecUpdated - startRowScanned);
+                        // output.write(vectorInfo->data.get(), i,
+                        //     startOffsetInOutput + vectorIdx * DEFAULT_VECTOR_CAPACITY +
+                        //         rowInVecUpdated - startRowScanned,
+                        //     1);
                     }
                 }
             }

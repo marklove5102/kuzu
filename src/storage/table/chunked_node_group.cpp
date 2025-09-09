@@ -3,7 +3,6 @@
 #include <exception>
 
 #include "common/assert.h"
-#include "common/exception/buffer_manager.h"
 #include "common/types/types.h"
 #include "storage/buffer_manager/buffer_manager.h"
 #include "storage/buffer_manager/memory_manager.h"
@@ -13,7 +12,9 @@
 #include "storage/table/column.h"
 #include "storage/table/column_chunk.h"
 #include "storage/table/column_chunk_data.h"
+#include "storage/table/combined_segment_scanner.h"
 #include "storage/table/node_table.h"
+#include "storage/table/segment_scanner.h"
 
 using namespace kuzu::common;
 using namespace kuzu::transaction;
@@ -331,8 +332,9 @@ void ChunkedNodeGroup::scanCommitted(Transaction* transaction, TableScanState& s
     }
     for (auto i = 0u; i < scanState.columnIDs.size(); i++) {
         const auto columnID = scanState.columnIDs[i];
+        auto segmentScanner = CombinedSegmentScanner{output.getColumnChunk(i)};
         chunks[columnID]->scanCommitted<SCAN_RESIDENCY_STATE>(transaction,
-            scanState.nodeGroupScanState->chunkStates[i], output.getColumnChunk(i));
+            scanState.nodeGroupScanState->chunkStates[i], segmentScanner);
     }
 }
 
@@ -340,6 +342,24 @@ template void ChunkedNodeGroup::scanCommitted<ResidencyState::ON_DISK>(Transacti
     TableScanState& scanState, InMemChunkedNodeGroup& output) const;
 template void ChunkedNodeGroup::scanCommitted<ResidencyState::IN_MEMORY>(Transaction* transaction,
     TableScanState& scanState, InMemChunkedNodeGroup& output) const;
+
+template<ResidencyState SCAN_RESIDENCY_STATE>
+void ChunkedNodeGroup::scanCommittedUpdatesOnly(Transaction* transaction, TableScanState& scanState,
+    SegmentScanner& output) const {
+    if (residencyState != SCAN_RESIDENCY_STATE) {
+        return;
+    }
+    for (auto i = 0u; i < scanState.columnIDs.size(); i++) {
+        const auto columnID = scanState.columnIDs[i];
+        chunks[columnID]->scanCommitted<SCAN_RESIDENCY_STATE>(transaction,
+            scanState.nodeGroupScanState->chunkStates[i], output);
+    }
+}
+
+template void ChunkedNodeGroup::scanCommittedUpdatesOnly<ResidencyState::ON_DISK>(
+    Transaction* transaction, TableScanState& scanState, SegmentScanner& output) const;
+template void ChunkedNodeGroup::scanCommittedUpdatesOnly<ResidencyState::IN_MEMORY>(
+    Transaction* transaction, TableScanState& scanState, SegmentScanner& output) const;
 
 bool ChunkedNodeGroup::hasDeletions(const Transaction* transaction) const {
     return versionInfo && versionInfo->hasDeletions(transaction);

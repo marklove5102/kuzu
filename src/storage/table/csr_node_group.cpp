@@ -4,7 +4,9 @@
 #include "storage/buffer_manager/memory_manager.h"
 #include "storage/storage_utils.h"
 #include "storage/table/column_chunk_data.h"
+#include "storage/table/combined_segment_scanner.h"
 #include "storage/table/csr_chunked_node_group.h"
+#include "storage/table/lazy_segment_scanner.h"
 #include "storage/table/rel_table.h"
 #include "transaction/transaction.h"
 
@@ -109,16 +111,28 @@ void CSRNodeGroup::initScanForCommittedPersistent(const Transaction* transaction
         auto nodeOffset = relScanState.nodeIDVector->readNodeOffset(pos);
         auto offsetInGroup = nodeOffset % StorageConfig::NODE_GROUP_SIZE;
         auto offsetToScanFrom = offsetInGroup == 0 ? 0 : offsetInGroup - 1;
-        csrHeader.offset->scanCommitted<ResidencyState::ON_DISK>(transaction, offsetState,
-            *nodeGroupScanState.header->offset, offsetToScanFrom, 1);
-        csrHeader.length->scanCommitted<ResidencyState::ON_DISK>(transaction, lengthState,
-            *nodeGroupScanState.header->length, offsetInGroup, 1);
+        {
+            auto segmentScanner = CombinedSegmentScanner{*nodeGroupScanState.header->offset};
+            csrHeader.offset->scanCommitted<ResidencyState::ON_DISK>(transaction, offsetState,
+                segmentScanner, offsetToScanFrom, 1);
+        }
+        {
+            auto segmentScanner = CombinedSegmentScanner{*nodeGroupScanState.header->length};
+            csrHeader.length->scanCommitted<ResidencyState::ON_DISK>(transaction, lengthState,
+                segmentScanner, offsetInGroup, 1);
+        }
     } else {
         auto numBoundNodes = csrHeader.offset->getNumValues();
-        csrHeader.offset->scanCommitted<ResidencyState::ON_DISK>(transaction, offsetState,
-            *nodeGroupScanState.header->offset);
-        csrHeader.length->scanCommitted<ResidencyState::ON_DISK>(transaction, lengthState,
-            *nodeGroupScanState.header->length);
+        {
+            auto segmentScanner = CombinedSegmentScanner{*nodeGroupScanState.header->offset};
+            csrHeader.offset->scanCommitted<ResidencyState::ON_DISK>(transaction, offsetState,
+                segmentScanner);
+        }
+        {
+            auto segmentScanner = CombinedSegmentScanner{*nodeGroupScanState.header->length};
+            csrHeader.length->scanCommitted<ResidencyState::ON_DISK>(transaction, lengthState,
+                segmentScanner);
+        }
         nodeGroupScanState.numTotalRows =
             nodeGroupScanState.header->getStartCSROffset(numBoundNodes);
     }
@@ -587,61 +601,107 @@ void CSRNodeGroup::checkpointColumn(const UniqLock& lock, column_id_t columnID,
             // Skip checkpoint for the column if it has no changes in the region.
             continue;
         }
-        auto regionCheckpointState = checkpointColumnInRegion(lock, columnID, csrState, region);
-        if (regionCheckpointState.numRows == 0) {
+        auto regionCheckpointStates = checkpointColumnInRegion(lock, columnID, csrState, region);
+        if (regionCheckpointStates.empty()) {
             // Skip the case when we have no rows to write for the region. This can happen when all
             // rows are deleted within the region. We don't aggressively reclaim the space in the
-            // region, but keep deleted rows aa gaps.
+            // region, but keep deleted rows as gaps.
             continue;
         }
-        chunkCheckpointStates.push_back(std::move(regionCheckpointState));
+        for (auto& regionCheckpointState : regionCheckpointStates) {
+            chunkCheckpointStates.push_back(std::move(regionCheckpointState));
+        }
     }
     persistentChunkGroup->getColumnChunk(columnID).checkpoint(*csrState.columns[columnID],
         std::move(chunkCheckpointStates), csrState.pageAllocator);
 }
 
-ChunkCheckpointState CSRNodeGroup::checkpointColumnInRegion(const UniqLock& lock,
+std::vector<ChunkCheckpointState> CSRNodeGroup::checkpointColumnInRegion(const UniqLock& lock,
     column_id_t columnID, const CSRNodeGroupCheckpointState& csrState,
     const CSRRegion& region) const {
     const auto leftCSROffset = csrState.oldHeader->getStartCSROffset(region.leftNodeOffset);
     const auto rightCSROffset = csrState.oldHeader->getEndCSROffset(region.rightNodeOffset);
     const auto numOldRowsInRegion = rightCSROffset - leftCSROffset;
-    const auto oldChunkWithUpdates = ColumnChunkFactory::createColumnChunkData(*csrState.mm,
-        dataTypes[columnID].copy(), false, numOldRowsInRegion, ResidencyState::IN_MEMORY);
     ChunkState chunkState;
     const auto& persistentChunk = persistentChunkGroup->getColumnChunk(columnID);
     persistentChunk.initializeScanState(chunkState, csrState.columns[columnID]);
+
+    auto segmentScanner = LazySegmentScanner{*csrState.mm,
+        csrState.columns[columnID]->getDataType().copy(), enableCompression};
     persistentChunk.scanCommitted<ResidencyState::ON_DISK>(&DUMMY_CHECKPOINT_TRANSACTION,
-        chunkState, *oldChunkWithUpdates, leftCSROffset, numOldRowsInRegion);
-    KU_ASSERT(leftCSROffset == csrState.newHeader->getStartCSROffset(region.leftNodeOffset));
+        chunkState, segmentScanner, leftCSROffset, numOldRowsInRegion);
+
+    const auto newLeftCSROffset = csrState.newHeader->getStartCSROffset(region.leftNodeOffset);
+    KU_ASSERT(leftCSROffset == newLeftCSROffset);
+    auto segmentScannerIt = segmentScanner.begin();
+
     const auto numRowsInRegion =
         csrState.newHeader->getEndCSROffset(region.rightNodeOffset) - leftCSROffset;
+    // TODO correctly set capacity here
     auto newChunk = ColumnChunkFactory::createColumnChunkData(*csrState.mm,
         dataTypes[columnID].copy(), false, numRowsInRegion, ResidencyState::IN_MEMORY);
     const auto dummyChunkForNulls = ColumnChunkFactory::createColumnChunkData(*csrState.mm,
         dataTypes[columnID].copy(), false, DEFAULT_VECTOR_CAPACITY, ResidencyState::IN_MEMORY);
     dummyChunkForNulls->resetToAllNull();
+
+    std::vector<ChunkCheckpointState> ret;
+    offset_t currentCSROffset = leftCSROffset;
+    std::optional<offset_t> startCSROffsetForChunk;
+
     // Copy per csr list from old chunk and merge with new insertions into the newChunkData.
     for (auto nodeOffset = region.leftNodeOffset; nodeOffset <= region.rightNodeOffset;
-         nodeOffset++) {
+        nodeOffset++) {
         const auto oldCSRLength = csrState.oldHeader->getCSRLength(nodeOffset);
         KU_ASSERT(csrState.oldHeader->getStartCSROffset(nodeOffset) >= leftCSROffset);
         const auto oldStartRow = csrState.oldHeader->getStartCSROffset(nodeOffset) - leftCSROffset;
-        const auto newStartRow = csrState.newHeader->getStartCSROffset(nodeOffset) - leftCSROffset;
-        KU_ASSERT(newStartRow == newChunk->getNumValues());
-        KU_UNUSED(newStartRow);
+        KU_ASSERT(currentCSROffset == csrState.newHeader->getStartCSROffset(nodeOffset));
         // Copy old csr list with updates into the new chunk.
         if (!region.hasPersistentDeletions) {
-            newChunk->append(oldChunkWithUpdates.get(), oldStartRow, oldCSRLength);
+            for (auto i = 0u; i < oldCSRLength; i++) {
+                if ((*segmentScannerIt).segmentData) {
+                    if (!startCSROffsetForChunk) {
+                        startCSROffsetForChunk = currentCSROffset;
+                    }
+                    newChunk->append((*segmentScannerIt).segmentData.get(),
+                        segmentScannerIt.offsetInSegment, 1);
+                } else if (newChunk->getNumValues() > 0) {
+                    KU_ASSERT(startCSROffsetForChunk.has_value());
+                    const auto numValuesToAppend = newChunk->getNumValues();
+                    ret.emplace_back(std::move(newChunk), *startCSROffsetForChunk,
+                        numValuesToAppend);
+                    newChunk = ColumnChunkFactory::createColumnChunkData(*csrState.mm,
+                        dataTypes[columnID].copy(), false, numRowsInRegion,
+                        ResidencyState::IN_MEMORY);
+                    startCSROffsetForChunk.reset();
+                }
+                ++segmentScannerIt;
+                ++currentCSROffset;
+            }
         } else {
             // TODO(Guodong): Optimize the for loop away by appending in batch
             for (auto i = 0u; i < oldCSRLength; i++) {
                 const auto csrOffsetInPersistentChunk = oldStartRow + i + leftCSROffset;
-                if (persistentChunkGroup->isDeleted(&DUMMY_CHECKPOINT_TRANSACTION,
+                if (!persistentChunkGroup->isDeleted(&DUMMY_CHECKPOINT_TRANSACTION,
                         csrOffsetInPersistentChunk)) {
-                    continue;
+                    if ((*segmentScannerIt).segmentData) {
+                        if (!startCSROffsetForChunk) {
+                            startCSROffsetForChunk = currentCSROffset;
+                        }
+                        newChunk->append((*segmentScannerIt).segmentData.get(),
+                            segmentScannerIt.offsetInSegment, 1);
+                    } else if (newChunk->getNumValues() > 0) {
+                        KU_ASSERT(startCSROffsetForChunk.has_value());
+                        const auto numValuesToAppend = newChunk->getNumValues();
+                        ret.emplace_back(std::move(newChunk), *startCSROffsetForChunk,
+                            numValuesToAppend);
+                        newChunk = ColumnChunkFactory::createColumnChunkData(*csrState.mm,
+                            dataTypes[columnID].copy(), false, numRowsInRegion,
+                            ResidencyState::IN_MEMORY);
+                        startCSROffsetForChunk.reset();
+                    }
+                    ++currentCSROffset;
                 }
-                newChunk->append(oldChunkWithUpdates.get(), oldStartRow + i, 1);
+                ++segmentScannerIt;
             }
         }
         // Merge in-memory insertions into the new chunk.
@@ -653,17 +713,25 @@ ChunkCheckpointState CSRNodeGroup::checkpointColumnInRegion(const UniqLock& lock
                 if (row == INVALID_ROW_IDX) {
                     continue;
                 }
+                if (!startCSROffsetForChunk) {
+                    startCSROffsetForChunk = currentCSROffset;
+                }
                 auto [chunkIdx, rowInChunk] = StorageUtils::getQuotientRemainder(row,
                     StorageConfig::CHUNKED_NODE_GROUP_CAPACITY);
                 const auto chunkedGroup = chunkedGroups.getGroup(lock, chunkIdx);
                 KU_ASSERT(!chunkedGroup->isDeleted(&DUMMY_CHECKPOINT_TRANSACTION, rowInChunk));
+                CombinedSegmentScanner insertionScanner{*newChunk};
                 chunkedGroup->getColumnChunk(columnID).scanCommitted<ResidencyState::IN_MEMORY>(
-                    &DUMMY_CHECKPOINT_TRANSACTION, chunkState, *newChunk, rowInChunk, 1);
+                    &DUMMY_CHECKPOINT_TRANSACTION, chunkState, insertionScanner, rowInChunk, 1);
+                ++currentCSROffset;
             }
         }
         // Fill gaps if any.
         int64_t numGaps = csrState.newHeader->getGapSize(nodeOffset);
         while (numGaps > 0) {
+            if (!startCSROffsetForChunk) {
+                startCSROffsetForChunk = currentCSROffset;
+            }
             // Gaps should only happen at the end of the CSR region.
             KU_ASSERT((nodeOffset == region.rightNodeOffset - 1) ||
                       (nodeOffset + 1) % StorageConfig::CSR_LEAF_REGION_SIZE == 0);
@@ -672,10 +740,17 @@ ChunkCheckpointState CSRNodeGroup::checkpointColumnInRegion(const UniqLock& lock
             dummyChunkForNulls->setNumValues(numGapsToFill);
             newChunk->append(dummyChunkForNulls.get(), 0, numGapsToFill);
             numGaps -= numGapsToFill;
+            currentCSROffset += numGapsToFill;
         }
     }
-    KU_ASSERT(newChunk->getNumValues() == numRowsInRegion);
-    return ChunkCheckpointState(std::move(newChunk), leftCSROffset, numRowsInRegion);
+
+    if (newChunk->getNumValues() > 0) {
+        KU_ASSERT(startCSROffsetForChunk.has_value());
+        const auto numValuesToAppend = newChunk->getNumValues();
+        ret.emplace_back(std::move(newChunk), *startCSROffsetForChunk, numValuesToAppend);
+    }
+
+    return ret;
 }
 
 void CSRNodeGroup::checkpointCSRHeaderColumns(const CSRNodeGroupCheckpointState& csrState) const {
@@ -706,7 +781,7 @@ void CSRNodeGroup::collectInMemRegionChangesAndUpdateHeaderLength(const UniqLock
     row_idx_t numInsertionsInRegion = 0u;
     if (csrIndex) {
         for (auto nodeOffset = region.leftNodeOffset; nodeOffset <= region.rightNodeOffset;
-             nodeOffset++) {
+            nodeOffset++) {
             auto rows = csrIndex->indices[nodeOffset].getRows();
             row_idx_t numInsertedRows = rows.size();
             row_idx_t numInMemDeletionsInCSR = 0;
@@ -739,7 +814,7 @@ void CSRNodeGroup::collectOnDiskRegionChangesAndUpdateHeaderLength(const UniqLoc
     int64_t numDeletionsInRegion = 0u;
     if (persistentChunkGroup) {
         for (auto nodeOffset = region.leftNodeOffset; nodeOffset <= region.rightNodeOffset;
-             nodeOffset++) {
+            nodeOffset++) {
             const auto numDeletedRows =
                 getNumDeletionsForNodeInPersistentData(nodeOffset, csrState);
             if (numDeletedRows == 0) {

@@ -187,6 +187,9 @@ public:
     template<ResidencyState SCAN_RESIDENCY_STATE>
     void scanCommitted(transaction::Transaction* transaction, TableScanState& scanState,
         InMemChunkedNodeGroup& output) const;
+    template<ResidencyState SCAN_RESIDENCY_STATE>
+    void scanCommittedUpdatesOnly(transaction::Transaction* transaction, TableScanState& scanState,
+        SegmentScanner &output) const;
 
     bool hasUpdates() const;
     bool hasDeletions(const transaction::Transaction* transaction) const;

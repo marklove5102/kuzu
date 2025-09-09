@@ -15,6 +15,7 @@ namespace kuzu {
 namespace storage {
 class MemoryManager;
 class Column;
+struct SegmentScanner;
 
 struct ChunkCheckpointState {
     std::unique_ptr<ColumnChunkData> chunkData;
@@ -69,7 +70,7 @@ public:
         common::ValueVector& output, common::offset_t offsetInChunk, common::length_t length) const;
     template<ResidencyState SCAN_RESIDENCY_STATE>
     void scanCommitted(const transaction::Transaction* transaction, ChunkState& chunkState,
-        ColumnChunkData& output, common::row_idx_t startRow = 0,
+        SegmentScanner& output, common::row_idx_t startRow = 0,
         common::row_idx_t numRows = common::INVALID_ROW_IDX) const;
     void lookup(const transaction::Transaction* transaction, const ChunkState& state,
         common::offset_t rowInChunk, common::ValueVector& output,
@@ -202,7 +203,7 @@ public:
             auto startOffsetInSegment =
                 std::max(std::min(segment->getNumValues(), startOffset), uint64_t{0});
             for (size_t i = startOffsetInSegment;
-                 i < segment->getNumValues() && startPos + i < endOffset; i++) {
+                i < segment->getNumValues() && startPos + i < endOffset; i++) {
                 func(segmentData[i], startPos + i);
             }
             startPos += segment->getNumValues();
@@ -291,9 +292,9 @@ public:
     }
 
 private:
-    void scanCommittedUpdates(const transaction::Transaction* transaction, ColumnChunkData& output,
-        common::offset_t startOffsetInOutput, common::row_idx_t startRowScanned,
-        common::row_idx_t numRows) const;
+    void scanCommittedUpdates(const transaction::Transaction* transaction, SegmentScanner& output,
+        common::idx_t segmentIdx, common::offset_t startOffsetInOutput,
+        common::row_idx_t startRowScanned, common::row_idx_t numRows) const;
 
     template<typename Func>
     void rangeSegments(common::offset_t offsetInChunk, common::length_t length, Func func) const {
